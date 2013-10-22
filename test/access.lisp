@@ -13,11 +13,24 @@
 
 (enable-dot-syntax)
 
+(defclass mop-test-object ()
+  ((slot-a :accessor slot-a :initarg :slot-a :initform nil)
+   (slot-b :accessor slot-b :initarg :slot-b :initform nil)
+   (slot-c :accessor slot-c :initarg :slot-c :initform nil)))
+
+(defparameter +mop+ (make-instance 'mop-test-object))
+
 (defun run-all-tests ()
   (let ((lisp-unit:*print-errors* t)
         (lisp-unit:*print-failures* t)
         (lisp-unit:*print-summary* t))
     (run-tests :all)))
+
+(defun run-a-test (test)
+  (let ((lisp-unit:*print-errors* t)
+        (lisp-unit:*print-failures* t)
+        (lisp-unit:*print-summary* t))
+    (run-tests (list test))))
 
 
 (defparameter +al+ `((:one . 1) ("two" . 2) ("three" . 3) (four . 4) (:5 . 5)))
@@ -191,6 +204,14 @@
       (assert-true warned? "We got a warning for multi-slot-matches"))
     (assert-eql 'access-test-other::my-slot (has-slot? o 'access-test-other::my-slot))))
 
+(define-test has-slot?2
+  (assert-true (has-slot? +mop+ 'slot-a))
+  (assert-true (has-slot? +mop+ :slot-a))
+  (assert-true (has-slot? +mop+ "slot-a"))
+  (assert-false (has-slot? +mop+ "slot-d"))
+  (assert-false (has-slot? +mop+ 'slot-d))
+  (assert-false (has-slot? +mop+ :slot-d)))
+
 (defclass accessed-object ()
   ((my-slot :initarg :my-slot :initform nil)
    (no-access :initarg :no-access :initform nil)
@@ -220,3 +241,58 @@
     (assert-eql :test3 (access o 'no-access) :slot-access-failed)
     ))
 
+(defclass slot-def-test-obj ()
+  ((acctexp :accessor acctexp :initarg :acctexp :initform nil)
+   (acct :accessor acct :initarg :acct :initform nil)
+   (acctexp2 :accessor acctexp2 :initarg :acctexp2 :initform nil)))
+
+(define-test slot-definition-tests
+  (let* ((o (make-instance 'slot-def-test-obj :acct 1008 :acctexp "1/1/2009" :acctexp2 "1/1/2011"))
+         (s (class-slot-by-name o "acct")))
+    (assert-eql 'acct (has-slot? o s))
+    (assert-eql #'(setf acct) (has-writer? o `(setf acct)))
+    (assert-eql #'(setf acct) (has-writer? o s))
+    (assert-eql #'(setf acct) (has-writer? o #'(setf acct)))
+    (assert-eql #'acct (has-reader? o s))
+    (assert-eql 1008 (access o s))))
+
+
+(define-test test-has-reader?
+  (assert-true (has-reader? +mop+ #'slot-a))
+  (assert-true (has-reader? +mop+ 'slot-a))
+  (assert-true (has-reader? +mop+ :slot-a))
+  (assert-true (has-reader? +mop+ "slot-a"))
+  (assert-false (has-reader? +mop+ "slot-d"))
+  (assert-false (has-reader? +mop+ 'slot-d))
+  (assert-false (has-reader? +mop+ :slot-d)))
+
+(define-test test-has-writer?
+  (assert-true (has-writer? +mop+ #'(setf slot-a)))
+  (assert-true (has-writer? +mop+ 'slot-a))
+  (assert-true (has-writer? +mop+ :slot-a))
+  (assert-true (has-writer? +mop+ "slot-a"))
+
+  (assert-true (has-writer? +mop+ '(setf slot-a)))
+  (assert-true (has-writer? +mop+ '(setf :slot-a)))
+  (assert-true (has-writer? +mop+ '(setf "slot-a")))
+  (assert-true (has-writer? +mop+ "(setf slot-a)"))
+  
+  (assert-false (has-writer? +mop+ "slot-d"))
+  (assert-false (has-writer? +mop+ 'slot-d))
+  (assert-false (has-writer? +mop+ :slot-d)))
+
+(define-test deep-null-alist
+  (let ((o (make-obj)))
+    (setf (accesses o 'pl '(:my-new-alist :type :plist) '(:a :type :alist)) "a")
+    (assert-equal "a" (accesses o 'pl '(:my-new-alist :type :plist) '(:a :type :alist)))
+    (assert-equal '((:a . "a")) (accesses o 'pl '(:my-new-alist :type :plist)))
+    (setf (accesses o 'pl '(:my-new-alist :type :plist) '("b" :type :alist)) 'b)
+    (assert-equal 'b (accesses o 'pl '(:my-new-alist :type :plist) '("b" :type :alist)))
+
+    (setf (accesses o 'pl) nil)
+
+    (setf (accesses o 'pl '(:my-new-alist :type :plist) '(:a :type :alist)) "a")
+    (assert-equal "a" (accesses o 'pl '(:my-new-alist :type :plist) '(:a :type :alist)))
+    (assert-equal '((:a . "a")) (accesses o 'pl '(:my-new-alist :type :plist)))
+    (setf (accesses o 'pl '(:my-new-alist :type :plist) '("b" :type :alist)) 'b)
+    (assert-equal 'b (accesses o 'pl '(:my-new-alist :type :plist) '("b" :type :alist)))))

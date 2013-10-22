@@ -8,8 +8,12 @@
    #:has-reader?
    #:has-writer?
    #:has-slot?
+   #:get-slot-value
+   #:ensure-slot-name
    #:class-of-object
    #:class-slot-by-name
+   #:class-slots
+   #:class-direct-slots
    #:class-direct-slot-names
    #:class-direct-slot-readers
    #:class-direct-slot-writers
@@ -154,83 +158,135 @@
 	(finally (return (values writers writer-names slot-names)))))
 
 (defun class-of-object ( o )
+  "returns the class of the object/symbol (or itself if it is a class),
+   if passed a list returns a list of these results"
   (typecase o
+    (keyword nil)
     (symbol (find-class o))
     (standard-class o)
     (standard-object (class-of o))))
 
-(defun class-direct-slot-readers ( o )
-  (awhen (class-of-object o)
-    (%slot-readers (closer-mop:class-direct-slots it ))))
+(defun appended (fn lst)
+  "Mapcan caused all sorts of trouble with its NCONCing"
+  (iter (for o in lst)
+    (appending (funcall fn o))))
 
-(defun class-slot-readers ( o )
-  (awhen (class-of-object o)
-    (%slot-readers (closer-mop:class-slots it))))
-
-(defun class-direct-slot-writers (o)
-  (awhen (class-of-object o)
-    (%slot-writers (closer-mop:class-direct-slots it))))
-
-(defun class-slot-writers (o)
-  (awhen (class-of-object o)
-    (%slot-writers (closer-mop:class-slots it))))
-
-(defun class-direct-slot-names (o)
-  (awhen (class-of-object o)
-    (mapcar
-     #'closer-mop:slot-definition-name
-     (closer-mop:class-direct-slots it))))
-
-(defun class-slot-names (o)
-  (awhen (class-of-object o)
-    (mapcar
-     #'closer-mop:slot-definition-name
-     (closer-mop:class-slots it))))
+(defgeneric class-slots (o)
+  (:documentation "returns the slots for the class/obj or list of class/obj passed in")
+  (:method (o)
+    (typecase o
+      (list (appended #'access:class-slots o))
+      (t
+       (awhen (class-of-object o)
+         (closer-mop:class-slots it))))))
 
 (defun class-slot-definitions (o)
-  (setf o (class-of-object o))
-  (when o (closer-mop:class-slots o)))
+  (class-slots o))
+
+(defun class-direct-slot-readers ( o )
+  "ensures o is a class (or list thereof) and returns all the direct slot reader functions)"
+  (typecase o
+    (list (appended #'access:class-direct-slot-readers o))
+    (t
+     (awhen (class-of-object o)
+       (%slot-readers (closer-mop:class-direct-slots it ))))))
+
+(defun class-slot-readers ( o )
+  (typecase o
+    (list (appended #'access:class-slot-readers o))
+    (t
+     (awhen (class-of-object o)
+       (%slot-readers (closer-mop:class-slots it))))))
+
+(defun class-direct-slot-writers (o)
+  (typecase o
+    (list (appended #'access:class-direct-slot-writers o))
+    (t
+     (awhen (class-of-object o)
+       (%slot-writers (closer-mop:class-direct-slots it))))))
+
+(defun class-slot-writers (o)
+  (typecase o
+    (list (appended #'access:class-slot-writers o))
+    (T
+     (awhen (class-of-object o)
+       (%slot-writers (closer-mop:class-slots it))))))
+
+(defun class-direct-slots (o)
+  (typecase o
+    (list (appended #'access:class-direct-slots o))
+    (t
+     (awhen (class-of-object o)
+       (closer-mop:class-direct-slots it)))))
+
+(defun class-direct-slot-names (o)
+  (mapcar
+   #'closer-mop:slot-definition-name
+   (access:class-direct-slots o)))
+
+(defun class-slot-names (o)
+  (mapcar
+   #'closer-mop:slot-definition-name
+   (access:class-slots o)))
 
 (defun class-slot-by-name (o k &key (test #'equalper) )
-  (setf o (class-of-object o))
-  (when o
-    (iter (for s in (closer-mop:class-slots o))
-      (for name = (closer-mop:slot-definition-name s))
-      (when (funcall test k name)
-        (return (values s name))))))
+  (iter (for s in (access:class-slots o))
+    (for name = (ensure-slot-name s))
+    (when (funcall test k name)
+      (return (values s name)))))
 
-(defun has-reader? (o reader-name)
+(defun ensure-slot-name (sn)
+  (typecase sn
+    (list (mapcar #'ensure-slot-name sn))
+    ((or symbol string) sn)
+    (closer-mop:slot-definition
+     (closer-mop:slot-definition-name sn))))
+
+(defun has-reader? (o reader-name
+                    &aux (match (ensure-slot-name reader-name)))
   "For o, does a reader function exist for it"
-  (when (and o reader-name)
+  (when (and o reader-name (typep o 'standard-object))
     (multiple-value-bind (readers names) (class-slot-readers o)
       (iter (for reader in readers)
-	    (for name in names)
-	    (when (typecase reader-name
-		    ((or keyword string) (string-equal (string name) (string reader-name)))
-		    (function (eql reader reader-name))
-		    (symbol (eql name reader-name))
-		    (T (access-warn "Not sure how to ~S maps to a function" reader-name)))
-	      (return (values reader name)))))))
+        (for name in names)
+        (when (typecase reader-name
+                (function (eql reader reader-name))
+                ((or symbol keyword string closer-mop:slot-definition)
+                 (equalper name match))
+                (T (access-warn "Not sure how to ~S maps to a function" reader-name)))
+          (return (values reader name)))))))
 
-(defun has-writer? (o writer-name)
+(defun has-writer? (o writer-name
+                    &aux (match (ensure-slot-name writer-name)))
   "For o, does a writer function exist for it?"
-  (when (and o writer-name)
+  (when (and o writer-name (typep o 'standard-object))
     (multiple-value-bind (writers wns sns) (class-slot-writers o)
-      (iter (for writer in writers)
-	    (for wn in wns)
-	    (for sn in sns)
-	    (when (typecase writer-name
-		    ((or keyword string)
-		       (or (string-equal (string sn) (string writer-name))
-			   (string-equal (princ-to-string wn) (string writer-name))))
-		    (function (eql writer writer-name))
-		    (list
-		       (or (equal wn writer-name)
-			   ;; setf-form ;; try again with just the slotname
-			   (has-writer? o (second writer-name))))
-		    (symbol (eql sn writer-name))
-		    (T (access-warn "Not sure how to ~S maps to a function" writer-name)))
-	      (return (values writer wn sn)))))))
+      (or
+       (iter (for writer in writers)
+         (for wn in wns)
+         (for sn in sns)
+         (when (typecase writer-name
+                 (function (eql writer writer-name))
+                 (string
+                  (or (equalper sn match) ;; handle "slot-name" matches
+                      ;; handle "(setf slot-name)" matches
+                      (equalper (princ-to-string wn) match)))
+                 ((or symbol keyword closer-mop:slot-definition)
+                  (or (equalper sn match) ;; handle slot-name matches
+                      (equalper wn match) ;; handle (setf slot-name) matches
+                      ))
+                 (list ;; exact list match
+                  (equal wn writer-name))
+                 (T (access-warn "Not sure how to ~S maps to a function" writer-name)))
+           (return (values writer wn sn))))
+       ;; setf-form ;; try again with just the slotname
+       (when (listp writer-name)
+         (has-writer? o (second writer-name)))))))
+
+(defun get-slot-value (o sn)
+  "like slot-value but without boundedness errors and works with slot definitions"
+  (setf sn (ensure-slot-name sn))
+  (and (slot-boundp o sn) (slot-value o sn)))
 
 (defun has-slot? (o slot-name &key (lax? t))
   "Does o have a slot names slot-name
@@ -238,17 +294,18 @@
    if lax? we will ignore packages to find the slot we will always return a
    slot-name from the specified package if it exists, otherwise we return the
    slot-name we found if its in a different package"
-  (unless o (return-from has-slot? nil))
-  (let ((slot-names (class-slot-names o))
+  (unless (and o (typep o 'standard-object)) (return-from has-slot? nil))
+  (let ((match (ensure-slot-name slot-name))
+        (slot-names (class-slot-names o))
         lax)
     (or
      (iter (for sn in slot-names)
        (cond
          ;; exact match - always return this first if we find it
-         ((eql sn slot-name) (return sn))
+         ((eql sn match) (return sn))
 
          ;; return the first lax match we find
-         ((and lax? (not lax) (equalper slot-name sn))
+         ((and lax? (not lax) (equalper sn match))
           (setf lax sn))
 
          ;; warn on any additional lax matches we find
@@ -264,40 +321,42 @@
 		    (return-from setf-if-applicable nil))))
     (setf fn
 	  (typecase fn
-	    ((or keyword string symbol) (has-writer? o fn))
+	    ((or keyword string symbol closer-mop:slot-definition)
+             (has-writer? o fn))
 	    (function fn)
 	    (T (access-warn "Not sure how to call a ~A" fn) ))))
-  (when fn
-    ;; complex if/whens instead of ands/ors because a standard generic function
-    ;; is a function, but we dont want to call it if not applicable
-    (if (typep fn 'standard-generic-function)
-	(when (compute-applicable-methods fn (list new o))
-	  (values (funcall fn new o) T))
-	(when (typep fn 'function)
-	  (values (funcall fn new o) T)))))
+  (etypecase fn
+    (null nil)
+    (standard-generic-function
+     (when (compute-applicable-methods fn (list new o))
+       (values (funcall fn new o) T)))
+    (function (values (funcall fn new o) T))))
 
-(defun call-if-applicable (o fn)
+(defun call-if-applicable (o fn &key (warn-if-not-a-fn? t))
   "See if there is a method named fn specialized on o, or a function named fn
-   and call it if so"
+   and call it if so
+
+   TODO: dont call macro functions/special forms, they are not applicable
+   "
   (handler-bind ((undefined-function
-		  (lambda (c) (declare (ignore c))
-		    (return-from call-if-applicable nil))))
+                   (lambda (c) (declare (ignore c))
+                     (return-from call-if-applicable nil))))
     (setf fn
 	  (typecase fn
-	    ((or keyword string) (has-reader? o fn))
+	    ((or keyword string closer-mop:slot-definition) (has-reader? o fn))
 	    (symbol (symbol-function fn))
 	    (function fn)
-	    (T (access-warn "Not sure how to call a ~A" fn) ))))
-  (when fn
-    ;; complex if/whens instead of ands/ors because a standard generic function
-    ;; is a function, but we dont want to call it if not applicable
-    (handler-case 
-	(if (typep fn 'standard-generic-function)
-	    (when (compute-applicable-methods fn (list o))
-	      (values (funcall fn o) T))
-	    (when (typep fn 'function)
-	      (values (funcall fn o) T)))
-      (unbound-slot (c) (declare (ignore c))))))
+	    (T (when warn-if-not-a-fn?
+                 (access-warn "Not sure how to call a ~A" fn))))))
+
+  (handler-case
+      (etypecase fn
+        (null nil)
+        (standard-generic-function
+         (when (compute-applicable-methods fn (list o))
+           (values (funcall fn o) T)))
+        (function (values (funcall fn o) T)))
+    (unbound-slot (c) (declare (ignore c)))))
 
 (defun call-applicable-fns (o &rest fns)
   "For an object and a list of fn/fn names, call-if-applicable repeatedly"
@@ -305,17 +364,24 @@
 	(setf o (call-if-applicable o fn)))
   o)
 
-(defun access (o k &key type (test #'equalper) (key #'identity))
-  "Access plists, alists, hashtables and clos objects all through the same interface"
+(defun access (o k &key type (test #'equalper) (key #'identity) skip-call?)
+  "Access plists, alists, hashtables and clos objects all through the same interface
+   skip-call, skips trying to call "
+  ;; make these easy to have the same defaults everywhere
+  (unless test (setf test #'equalper))
+  (unless key (setf key #'identity))
   (if (null type)
       (typecase o
 	(list (if (consp (first o))
 		  (access o k :type :alist :test test :key key)
 		  (access o k :type :plist :test test :key key)))
-	(hash-table (access o k :type :hash-table :test test :key key))
-	(standard-object (access o k :type :object :test test :key key))
-	(sequence (access o k :type :sequence :test test :key key)))
-      (multiple-value-bind (res called) (call-if-applicable o k)
+	(hash-table (access o k :type :hash-table :test test :key key))  
+	(sequence (access o k :type :sequence :test test :key key))
+	(standard-object (access o k :type :object :test test :key key)))
+      ;; lets suppress the warning if it is just being called through access
+      (multiple-value-bind (res called)
+          (unless skip-call?
+            (call-if-applicable o k :warn-if-not-a-fn? nil))
 	(if called
 	    res
 	    (case type
@@ -344,6 +410,9 @@
 
 (defun set-access (new o k &key type (test #'equalper) (key #'identity))
   "set places in plists, alists, hashtables and clos objects all through the same interface"
+  ;; make these easy to have the same defaults everywhere
+  (unless test (setf test #'equalper))
+  (unless key (setf key #'identity))
   (if (null type)
       (typecase o
         (list (if (consp (first o))
@@ -390,7 +459,8 @@
                        ))
                  o)))))))
 
-(define-setf-expander access (place key
+(define-setf-expander access (place k
+                              &key type test key
                               &environment env
                               &aux (new-val (gensym "NEW-VAL"))
                               (place-store (gensym "PLACE")))
@@ -400,16 +470,18 @@
           ()   ;; not using temp vals
           `(,new-val)
           `(multiple-value-bind (,new-val ,place-store)
-            (set-access ,new-val ,place ,key)
+            (set-access ,new-val ,place ,k :test ,test :type ,type :key ,key)
             (setf ,place ,place-store)
             ,new-val)
-          `(access ,place ,key)))
+          `(access ,place ,k :test ,test :type ,type :key ,key )))
 
 (defun accesses (o &rest keys)
   "keep accessing keys on resulting objects
    eg: (accesses o k1 k2) => (access (access o k1) k2)"
   (iter (for k in keys)
-    (setf o (access o k)))
+    (destructuring-bind (k &key type test key)
+        (alexandria:ensure-list k)
+      (setf o (access o k :test test :type type :key key ))))
   o)
 
 (defun set-accesses (new o &rest keys)
@@ -420,13 +492,15 @@
    (so for a plist / alist you have a ref to the val and the full list)
   "
   (labels ((rec-set (o key more)
-             (cond
-               (more
-                (multiple-value-bind (new new-place-val)
-                    (rec-set (access o key) (first more) (rest more))
-                  (setf (access o key) new-place-val)
-                  (values new o)))
-               (T (set-access new o key)))))
+             (destructuring-bind (k &key type test key) (alexandria:ensure-list key)
+               (cond
+                 (more
+                  (multiple-value-bind (new new-place-val)
+                      (rec-set (access o k :test test :type type :key key)
+                               (first more) (rest more))
+                    (setf (access o k :test test :type type :key key) new-place-val)
+                    (values new o)))
+                 (T (set-access new o k :test test :type type :key key))))))
     (rec-set o (first keys) (rest keys))))
 
 (define-setf-expander accesses (place &rest keys
@@ -491,7 +565,7 @@
        (t class-name)))
     (symbol class-name)))
 
-(defmacro with-access-values (bindings obj &body body)
+(defmacro with-access-values ((&rest bindings) obj &body body)
   "A macro which binds local variables from accessed values on object
    according to bindings
 
