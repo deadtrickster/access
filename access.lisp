@@ -313,7 +313,8 @@
 		  (access o k :type :alist :test test :key key)
 		  (access o k :type :plist :test test :key key)))
 	(hash-table (access o k :type :hash-table :test test :key key))
-	(standard-object (access o k :type :object :test test :key key)))
+	(standard-object (access o k :type :object :test test :key key))
+	(sequence (access o k :type :sequence :test test :key key)))
       (multiple-value-bind (res called) (call-if-applicable o k)
 	(if called
 	    res
@@ -563,33 +564,38 @@
 
 ;;;; DOT Syntax stuff
 
-(defun split-dot-sym (sym)
-  (iter (for piece in (cl-ppcre:split "\\." (string sym)))
-    (collect (intern piece (or (symbol-package sym) *package*)))))
+(defun split-dot-sym (sym only-at)
+  (if (keywordp sym)
+      (list  sym)
+      (let ((symbol-name (symbol-name sym)))
+        (if (or (not only-at) (eql (aref symbol-name 0) #\@))
+            (iter (for piece in (cl-ppcre:split "\\." (string sym)))
+              (collect (intern piece (or (symbol-package sym) *package*))))
+            (list sym)))))
 
-(defun translate-dot-sym (sym)
-  (let* ((pieces (split-dot-sym sym))
+(defun translate-dot-sym (sym only-at)
+  (let* ((pieces (split-dot-sym sym only-at))
 	 (fns (iter (for sym in (rest pieces))
 		    (collect `(quote ,sym)))))
     (if (eql 1 (length pieces))
 	sym
 	`(accesses ,(first pieces) ,@fns))))
 
-(defun dot-translate-walker (form)
+(defun dot-translate-walker (form only-at)
   (typecase form
-    (cons (cons (dot-translate-walker (car form))
-		(dot-translate-walker (cdr form))))
-    (symbol (translate-dot-sym form))
+    (cons (cons (dot-translate-walker (car form) only-at)
+                (dot-translate-walker (cdr form)  only-at)))
+    (symbol (translate-dot-sym form  only-at))
     (atom form)))
 
 (defun name-has-dot? (n)
   (cl-ppcre:all-matches "\\." (string n)))
 
-(defun replace-dot-calls (forms)
-  (dot-translate-walker forms))
+(defun replace-dot-calls (forms only-at)
+  (dot-translate-walker forms only-at))
 
-(defmacro with-dot (() &body body)
-  `(progn ,@(replace-dot-calls body)))
+(defmacro with-dot ((&key only-at) &body body)
+  `(progn ,@(replace-dot-calls body only-at)))
 
 (defun dot-reader (-stream- char arg)
   "Reads a form and replaces dot calls"
