@@ -33,8 +33,10 @@
    ;; main stuff
    #:access
    #:accesses
+   #:do-access
    #:set-access
    #:set-accesses
+   #:do-set-access
    #:access-copy
    #:mutate-access
    #:with-access
@@ -70,7 +72,7 @@
 	      (format-control c)
 	      (format-args c)))))
 
-(define-condition access-warning (access-condition warning) ())
+(define-condition access-warning (warning access-condition) ())
 
 (defun access-warn (message &rest args)
   (warn (make-condition 'access-warning
@@ -133,24 +135,30 @@
 
 (defun %slot-readers (slots)
   (iter (for slot in (ensure-list slots))
-	(for reader-name = (or (first (closer-mop::slot-definition-readers slot))
-  ;; NB: We should probably check for a reader fn here before assuming
-  ;; the slot name is a reader-fn, but I couldnt find a cross platform way
-  ;; of doing this
-			      (closer-mop:slot-definition-name slot)))
-	(collecting reader-name into names)
-	;; some valid slot names are not valid function names (see type)
-	(collecting (ignore-errors
-		      (symbol-function reader-name)) into readers)
-	(finally (return (values readers names)))))
+    (for reader-name =
+         (or
+          ;; ESD's might not have this slot apparently
+          (and
+           (typep slot 'closer-mop:direct-slot-definition)
+           (first (closer-mop::slot-definition-readers slot)))
+          ;; NB: We should probably check for a reader fn here before assuming
+          ;; the slot name is a reader-fn, but I couldnt find a cross platform way
+          ;; of doing this
+          (closer-mop:slot-definition-name slot)))
+    (collecting reader-name into names)
+    ;; some valid slot names are not valid function names (see type)
+    (collecting (ignore-errors
+                 (symbol-function reader-name)) into readers)
+    (finally (return (values readers names)))))
 
 (defun %slot-writers (slots)
   (iter (for slot in (ensure-list slots))
 	(for sn = (closer-mop::slot-definition-name slot))
 	;; effective slots dont have readers or writers
 	;; but direct slots do, no idea why, I asked and its in the spec
-	(for wn = (or (first (closer-mop::slot-definition-writers slot))
-		      `(setf ,sn)))
+    (for wn = (or (and (typep slot 'closer-mop:direct-slot-definition)
+                       (first (closer-mop::slot-definition-writers slot)))
+                  `(setf ,sn)))
 	(collecting wn into writer-names)
 	(collecting sn into slot-names)
 	;; some valid slot names are not valid function names (see type)
@@ -164,6 +172,7 @@
     (keyword nil)
     (symbol (find-class o))
     (standard-class o)
+    (condition (class-of o))
     (standard-object (class-of o))))
 
 (defun appended (fn lst)
@@ -178,6 +187,7 @@
       (list (appended #'access:class-slots o))
       (t
        (awhen (class-of-object o)
+         (closer-mop:ensure-finalized it)
          (closer-mop:class-slots it))))))
 
 (defun class-slot-definitions (o)
@@ -217,6 +227,7 @@
     (list (appended #'access:class-direct-slots o))
     (t
      (awhen (class-of-object o)
+       (closer-mop:ensure-finalized it)
        (closer-mop:class-direct-slots it)))))
 
 (defun class-direct-slot-names (o)
@@ -253,6 +264,7 @@
                 (function (eql reader reader-name))
                 ((or symbol keyword string closer-mop:slot-definition)
                  (equalper name match))
+                ((or list number) nil) ;; compound-keys , array indexes
                 (T (access-warn "Not sure how to ~S maps to a function" reader-name)))
           (return (values reader name)))))))
 
@@ -289,12 +301,13 @@
   (and (slot-boundp o sn) (slot-value o sn)))
 
 (defun has-slot? (o slot-name &key (lax? t))
-  "Does o have a slot names slot-name
+  "Does o have a slot named slot-name
 
    if lax? we will ignore packages to find the slot we will always return a
    slot-name from the specified package if it exists, otherwise we return the
    slot-name we found if its in a different package"
-  (unless (and o (typep o 'standard-object)) (return-from has-slot? nil))
+  (unless (and o (typep o '(or standard-object condition)))
+    (return-from has-slot? nil))
   (let ((match (ensure-slot-name slot-name))
         (slot-names (class-slot-names o))
         lax)
@@ -302,16 +315,16 @@
      (iter (for sn in slot-names)
        (cond
          ;; exact match - always return this first if we find it
-         ((eql sn match) (return sn))
-
-         ;; return the first lax match we find
-         ((and lax? (not lax) (equalper sn match))
-          (setf lax sn))
-
-         ;; warn on any additional lax matches we find
-         ((and lax? lax (equalper slot-name sn))
-          (access-warn "Multiple slots inexactly matched for ~a on ~a" slot-name o))))
-     lax)))
+         ((eql sn match)
+          (return sn))
+         ;; save the lax matches
+         ((and lax? (equalper sn match))
+          (push sn lax))))
+     (cond
+       ((< 1 (length lax))
+        (access-warn "Multiple slots inexactly matched for ~a on ~a" slot-name o)
+        (first (reverse lax)))
+       (t (first lax))))))
 
 (defun setf-if-applicable (new o fn)
   "If we find a setf function named (setf fn) that can operate on o then call
@@ -324,6 +337,7 @@
 	    ((or keyword string symbol closer-mop:slot-definition)
              (has-writer? o fn))
 	    (function fn)
+            ((or number list) nil);; compound-keys and indexes
 	    (T (access-warn "Not sure how to call a ~A" fn) ))))
   (etypecase fn
     (null nil)
@@ -346,6 +360,7 @@
 	    ((or keyword string closer-mop:slot-definition) (has-reader? o fn))
 	    (symbol (symbol-function fn))
 	    (function fn)
+            ((or number list) nil);; compound-keys and indexes
 	    (T (when warn-if-not-a-fn?
                  (access-warn "Not sure how to call a ~A" fn))))))
 
@@ -364,102 +379,168 @@
 	(setf o (call-if-applicable o fn)))
   o)
 
-(defun access (o k &key type (test #'equalper) (key #'identity) skip-call?)
-  "Access plists, alists, hashtables and clos objects all through the same interface
+(defgeneric do-access  (o k &key type test key skip-call?)
+  (:method ((o list) k &key type test key skip-call?)
+    (declare (ignore skip-call?))
+    (if (or (eql type :alist)
+            (and (null type) (consp (first o))))
+        ;;alist
+        (cdr (assoc k o :test test :key key))
+        ;;plist
+        (plist-val k o :test test :key key)
+        ))
+
+  (:method ((o array) k &key type test key skip-call?)
+    (declare (ignore type test key skip-call?))
+    (apply #'aref o (ensure-list k)))
+  
+  (:method ((o sequence) k &key type test key skip-call?)
+    (declare (ignore type test key skip-call?))
+    (elt o k))
+
+  (:method ((o hash-table) k &key type test key skip-call?)
+    (declare (ignore type test key skip-call?))
+    (multiple-value-bind (res found) (gethash k o)
+      (if found
+          res
+          (awhen (ignore-errors (string k))
+            (gethash it o)))))
+  
+  (:method ( o  k &key type test key skip-call?)
+    ;; not specializing on standard-object here
+    ;; allows this same code path to work with conditions (in sbcl)
+    (let ((actual-slot-name (has-slot? o k)))
+      (cond
+        ;; same package as requested, must be no accessor so handle slots
+        ((eql actual-slot-name k)
+         (when (slot-boundp o k)
+           (slot-value o k)))
+
+        ;; lets recheck for an accessor in the correct package
+        (actual-slot-name
+         (access o actual-slot-name :type type :test test :key key
+                                    :skip-call? skip-call?))
+        ))))
+
+(defun access (o k &key type (test #'equalper) (key #'identity)
+                   skip-call?)
+  "Access plists, alists, arrays, hashtables and clos objects
+   all through the same interface
+
    skip-call, skips trying to call "
   ;; make these easy to have the same defaults everywhere
   (unless test (setf test #'equalper))
   (unless key (setf key #'identity))
-  (if (null type)
-      (typecase o
-	(list (if (consp (first o))
-		  (access o k :type :alist :test test :key key)
-		  (access o k :type :plist :test test :key key)))
-	(hash-table (access o k :type :hash-table :test test :key key))  
-	(sequence (access o k :type :sequence :test test :key key))
-	(standard-object (access o k :type :object :test test :key key)))
-      ;; lets suppress the warning if it is just being called through access
-      (multiple-value-bind (res called)
-          (unless skip-call?
-            (call-if-applicable o k :warn-if-not-a-fn? nil))
-	(if called
-	    res
-	    (case type
-	      (:plist
-               (plist-val k o :test test :key key))
-	      (:alist
-               (cdr (assoc k o :test test :key key)))
-        (:sequence
-                (elt o k))
-	      (:hash-table
-               (multiple-value-bind (res found) (gethash k o)
-                 (if found
-                     res
-                     (awhen (ignore-errors (string k))
-                       (gethash it o)))))
-	      (:object
-                  (let ((actual-slot-name (has-slot? o k)))
-                     (cond
-                       ;; same package as requested, must be no accessor so handle slots
-                       ((eql actual-slot-name k)
-                        (when (slot-boundp o k)
-                          (slot-value o k)))
+  (multiple-value-bind (res called)
+      (unless skip-call?
+        ;; lets suppress the warning if it is just being called through access
+        (call-if-applicable o k :warn-if-not-a-fn? nil))
+    (if called
+        res
+        (do-access o k :test test :key key :type type)
+        )))
 
-                       ;; lets recheck for an accessor in the correct package
-                       (actual-slot-name
-                        (access o actual-slot-name :type type :test test :key key))
-                       ))))))))
+(defun %initialize-null-container (o k type test)
+  (or o
+      (when type
+        (cond
+          ((or (member type '(:hash-table))
+               (subtypep type 'hash-table))
+           (make-hash-table :test (%to-hash-test test)))
+
+          ((or (member type '(:array)) (subtypep type 'array))
+           ;;make an array big enough to hold our key
+           (make-array (apply #'+ 1 (ensure-list k))
+                       :adjustable t
+                       :initial-element nil))
+
+          ((subtypep type 'standard-object)
+           (make-instance type))))))
+
+(defgeneric do-set-access (new o k &key type test key)
+  
+  ;; always return the new value as the first value
+  ;; every primary method should return the modified object
+  (:method :around (new o k &key type test key)
+    (declare (ignore o k type test key))
+    (values new (call-next-method)))
+  
+  (:method (new (o list) k &key type test key )
+    (if (or (eql type :alist)
+            (and (null type) (consp (first o))))
+        ;;alist
+        (aif (assoc k o :test test :key key)
+             (progn (setf (cdr it) new)
+                    o)
+             (list* (cons k new) o))
+        ;;plist
+        (set-plist-val new k o :test test :key key)
+        ))
+  
+  (:method (new (o array) k &key type test key)
+    (declare (ignore type test key))
+    #+clisp
+    (setf (apply #'aref o (ensure-list k)) new)
+    #-clisp
+    (apply '(setf aref) new o (ensure-list k))
+    o)
+
+  (:method (new (o hash-table) k &key type test key)
+    (declare (ignore type test key))
+    (let ((skey (string k)))
+      (multiple-value-bind (res found) (gethash k o)
+        (declare (ignore res))
+        (multiple-value-bind (sres sfound)
+            (awhen skey (gethash it o))
+          (declare (ignore sres))
+          (cond
+            (found (setf (gethash k o) new))
+            (sfound (setf (gethash skey o) new))
+            (T (setf (gethash k o) new))))))
+    o)
+  
+  (:method (new (o standard-object) k &key type test key)
+    (declare (ignore type test key))
+    (let ((actual-slot-name (has-slot? o k)))
+      (cond
+        ;; same package so there must be no accessor
+        ((eql actual-slot-name k)
+         (setf (slot-value o k) new))
+        ;; different package, but we have a slot, so lets look for its accessor
+        (actual-slot-name
+         (set-access new o actual-slot-name))
+        ))
+    o))
 
 (defun set-access (new o k &key type (test #'equalper) (key #'identity))
-  "set places in plists, alists, hashtables and clos objects all through the same interface"
+  "set places in plists, alists, hashtables and clos objects all
+   through the same interface"
   ;; make these easy to have the same defaults everywhere
   (unless test (setf test #'equalper))
   (unless key (setf key #'identity))
-  (if (null type)
-      (typecase o
-        (list (if (consp (first o))
-                  (set-access new o k :type :alist :test test :key key)
-                  (set-access new o k :type :plist :test test :key key)))
-        (hash-table (set-access new o k :type :hash-table :test test :key key))
-        (standard-object (set-access new o k :type :object :test test :key key)))
-      (multiple-value-bind (res called) (setf-if-applicable new o k)
-        (if called
-            (values res o)
-            (values
-             new
-             (case type
-               (:plist
-                (set-plist-val new k o :test test :key key))
-               (:alist
-                (aif (assoc k o :test test :key key)
-                     (progn (setf (cdr it) new) o)
-                     (list* (cons k new) o)))
-               (:hash-table
-                (let ((skey (string k)))
-                  (multiple-value-bind (res found) (gethash k o)
-                    (declare (ignore res))
-                    (multiple-value-bind (sres sfound)
-                        (awhen skey (gethash it o))
-                      (declare (ignore sres))
-                      (cond
-                        (found (setf (gethash k o) new))
-                        ((or sfound skey) (setf (gethash skey o) new))
-                        (T (setf (gethash k o) new)))
-                      (if found
-                          (setf (gethash k o) new)))
-                    ))
-                o)
-               (:object
-                   (let ((actual-slot-name (has-slot? o k)))
-                     (cond
-                       ;; same package so there must be no accessor
-                       ((eql actual-slot-name k)
-                        (setf (slot-value o k) new))
-                       ;; different package, but we have a slot, so lets look for its accessor
-                       (actual-slot-name
-                        (set-access new o actual-slot-name :type type :test test :key key))
-                       ))
-                 o)))))))
+  (setf o (%initialize-null-container o k type test))
+  (multiple-value-bind (res called) (setf-if-applicable new o k)
+    (if called
+        (values res o)
+        (do-set-access new o k :type type :test test :key key))))
+
+(defun %to-hash-test (test)
+  (typecase test
+    (null 'eql)
+    (symbol test)
+    ;; dequote double quoted tests
+    ;; (its pretty easy to double quote with accesses)
+    (list (eql 'quote (first test))
+     (%to-hash-test (second test)))
+    (function
+     (cond
+       ((eql test #'eql) 'eql)
+       ((eql test #'equal) 'equal)
+       ;; equalper does string based symbol comparing
+       ;; we also handle this for hashtables separately
+       ;; so I think this should be fine
+       ((member test (list #'equalp #'equalper)) 'equalp)
+       (t (error "Hashtable tests should be a symbol! See make-hashtable"))))))
 
 (define-setf-expander access (place k
                               &key type test key
@@ -471,10 +552,11 @@
   (values ()   ;; not using temp vars
           ()   ;; not using temp vals
           `(,new-val)
-          `(multiple-value-bind (,new-val ,place-store)
-            (set-access ,new-val ,place ,k :test ,test :type ,type :key ,key)
-            (setf ,place ,place-store)
-            ,new-val)
+          `(progn
+            (multiple-value-bind (,new-val ,place-store)
+                (set-access ,new-val ,place ,k :test ,test :type ,type :key ,key)
+              (setf ,place ,place-store)
+              ,new-val))
           `(access ,place ,k :test ,test :type ,type :key ,key )))
 
 (defun accesses (o &rest keys)
@@ -494,9 +576,13 @@
    (so for a plist / alist you have a ref to the val and the full list)
   "
   (labels ((rec-set (o key more)
-             (destructuring-bind (k &key type test key) (alexandria:ensure-list key)
+             (destructuring-bind (k &key type test key)
+                 (alexandria:ensure-list key)
+               ;(unless test (setf test #'equalper))
+               ;(unless key (setf key #'identity))
                (cond
                  (more
+                  (setf o (%initialize-null-container o k type test))
                   (multiple-value-bind (new new-place-val)
                       (rec-set (access o k :test test :type type :key key)
                                (first more) (rest more))
