@@ -389,6 +389,8 @@
                (plist-val k o :test test :key key))
 	      (:alist
                (cdr (assoc k o :test test :key key)))
+        (:sequence
+                (elt o k))
 	      (:hash-table
                (multiple-value-bind (res found) (gethash k o)
                  (if found
