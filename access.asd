@@ -11,16 +11,17 @@
       access and (setf access)"
   :licence "BSD"
   :author "Acceleration.net, Russ Tyndall, Nathan Bird, Ryan Davis"
-  :version "1"
+  :version "1.5.0"
   :serial t
   :components ((:file "access")
                (:file "arg-list-manipulation"))
-  :depends-on (:iterate :closer-mop :alexandria :anaphora :cl-interpol))
+  :depends-on (:iterate :closer-mop :alexandria :anaphora :cl-interpol)
+  :in-order-to ((test-op (load-op :access-test))))
 
 (defsystem :access-test
   :description "Tests for the access library"
   :licence "BSD"
-  :version "1"
+  :version "1.5.0"
   :author "Acceleration.net, Russ Tyndall, Nathan Bird, Ryan Davis"
   :serial t
   :components ((:module :test
